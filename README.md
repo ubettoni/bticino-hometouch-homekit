@@ -232,6 +232,25 @@ internet: it moves a physical gate.
 Full Home Assistant wiring (notifications, snapshot, reply button, Lovelace
 button, Apple Home switch) is documented in `docs/home-automation.md`.
 
+### Connection persistence (NAT keepalive)
+
+Incoming calls arrive over the same outbound TLS connection, so the bridge
+must keep it alive. Compared against the official app
+(`Door Entry for HOMETOUCH` 1.9.2, Linphone stack):
+
+| Behaviour | Official app | This listener |
+| --- | --- | --- |
+| REGISTER refresh | about every minute | every ~240 s (`REGISTER_EXPIRES = 300`) |
+| NAT keepalive | enabled (Linphone) | CRLF ping (`\r\n\r\n`) every 25 s, inbound pings skipped per RFC 5626 |
+| SIP instance id | stable, persisted | stable, persisted in `runtime/sip-instance.uuid` (mode 600) |
+| Incoming-call wakeup | Firebase push (`pn-provider=fcm` in Contact) | persistent connection (no push; fake `pn-*` params are deliberately not sent) |
+
+If the router/firewall silently drops the idle mapping, the server cannot push
+`INVITE`s: registration still succeeds but no call ever arrives. Symptoms are
+`REGISTER` refresh timeouts followed by reconnects, with no `SIP RX: INVITE`
+in between. The keepalive thread detects a dead link on write failure and
+forces an immediate reconnect instead of waiting for the next refresh.
+
 ### Cross-platform listener
 
 The listener is ordinary Python and can be started directly on a compatible

@@ -75,8 +75,10 @@ SERVER_IP = CONFIG.get("sip_server") or os.environ.get("BTICINO_SIP_SERVER", "")
 SERVER_PORT = int(CONFIG.get("sip_port", 5061))
 DOMAIN = CONFIG.get("sip_domain") or os.environ.get("BTICINO_SIP_DOMAIN", "")
 
-REGISTER_EXPIRES = 600
+REGISTER_EXPIRES = 300
 REFRESH_MARGIN = 90
+KEEPALIVE_INTERVAL = 25.0
+SIP_INSTANCE_FILE = RUNTIME_DIR / "sip-instance.uuid"
 RECONNECT_INITIAL_DELAY = float(CONFIG.get("reconnect_initial_delay", 0.25))
 RECONNECT_MAX_DELAY = float(CONFIG.get("reconnect_max_delay", 10.0))
 RECONNECT_STABLE_AFTER = float(CONFIG.get("reconnect_stable_after", 30.0))
@@ -308,6 +310,33 @@ def validate_runtime_settings():
         raise RuntimeError(
             "configurazione SIP incompleta: " + ", ".join(missing)
         )
+
+
+def sip_instance_uuid():
+    """Stable SIP instance id across restarts (RFC 5626 replacement)."""
+    try:
+        value = SIP_INSTANCE_FILE.read_text(encoding="utf-8").strip()
+        uuid.UUID(value)
+        return value
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    value = str(uuid.uuid4())
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            SIP_INSTANCE_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(SIP_INSTANCE_FILE, flags, 0o600)
+        except FileExistsError:
+            return value
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(value + "\n")
+    except OSError:
+        pass
+    return value
 
 
 def diagnostic_key():
@@ -789,39 +818,48 @@ class SIPStream:
     def read_message(self, timeout=5):
         self.sock.settimeout(timeout)
 
-        while b"\r\n\r\n" not in self.buffer:
-            chunk = self.sock.recv(16384)
+        while True:
+            while b"\r\n\r\n" not in self.buffer:
+                chunk = self.sock.recv(16384)
 
-            if not chunk:
-                raise ConnectionError("connessione SIP chiusa")
+                if not chunk:
+                    raise ConnectionError("connessione SIP chiusa")
 
-            self.buffer += chunk
+                self.buffer += chunk
 
-        header_end = self.buffer.index(b"\r\n\r\n") + 4
+            # Scarta eventuali CRLF di keepalive in arrivo (RFC 5626).
+            self.buffer = self.buffer.lstrip(b"\r\n")
+            if b"\r\n\r\n" not in self.buffer:
+                continue
 
-        header_blob = self.buffer[:header_end]
-        header_text = header_blob.decode("utf-8", errors="replace")
+            header_end = self.buffer.index(b"\r\n\r\n") + 4
 
-        m = re.search(
-            r"(?im)^Content-Length\s*:\s*(\d+)\s*$",
-            header_text
-        )
+            header_blob = self.buffer[:header_end]
+            header_text = header_blob.decode("utf-8", errors="replace")
 
-        body_len = int(m.group(1)) if m else 0
-        total_len = header_end + body_len
+            m = re.search(
+                r"(?im)^Content-Length\s*:\s*(\d+)\s*$",
+                header_text
+            )
 
-        while len(self.buffer) < total_len:
-            chunk = self.sock.recv(16384)
+            body_len = int(m.group(1)) if m else 0
+            total_len = header_end + body_len
 
-            if not chunk:
-                raise ConnectionError("connessione SIP chiusa durante body")
+            while len(self.buffer) < total_len:
+                chunk = self.sock.recv(16384)
 
-            self.buffer += chunk
+                if not chunk:
+                    raise ConnectionError("connessione SIP chiusa durante body")
 
-        raw = self.buffer[:total_len]
-        self.buffer = self.buffer[total_len:]
+                self.buffer += chunk
 
-        return raw
+            raw = self.buffer[:total_len]
+            self.buffer = self.buffer[total_len:]
+
+            if not raw.strip():
+                continue
+
+            return raw
 
 
 def sip_first_line(raw):
@@ -1311,7 +1349,7 @@ class HomtouchListener:
 
         self.call_id = f"{uuid.uuid4().hex}@hometouch-listener"
         self.from_tag = token(8)
-        self.instance_uuid = str(uuid.uuid4())
+        self.instance_uuid = sip_instance_uuid()
 
         self.cseq = 1
 
@@ -1319,6 +1357,10 @@ class HomtouchListener:
         self.next_refresh = 0
         self.media = {}
         self.dialog_tags = {}
+        self.send_lock = threading.Lock()
+        self.keepalive_stop = threading.Event()
+        self.link_dead = threading.Event()
+        self.keepalive_thread = None
 
 
     def connect(self):
@@ -1346,7 +1388,25 @@ class HomtouchListener:
 
 
     def send(self, text):
-        self.sock.sendall(text.encode("utf-8"))
+        with self.send_lock:
+            self.sock.sendall(text.encode("utf-8"))
+
+
+    def keepalive_loop(self):
+        """CRLF periodici (stile RFC 5626) per tenere viva la connessione."""
+        while RUNNING and not self.keepalive_stop.wait(KEEPALIVE_INTERVAL):
+            sock = self.sock
+            if sock is None:
+                break
+            try:
+                with self.send_lock:
+                    if self.sock is not sock:
+                        continue
+                    sock.sendall(b"\r\n\r\n")
+            except OSError as exc:
+                log(f"SIP keepalive fallito ({type(exc).__name__}); riconnessione")
+                self.link_dead.set()
+                break
 
 
     def build_register(self, authorization=None, expires=REGISTER_EXPIRES):
@@ -1871,39 +1931,55 @@ class HomtouchListener:
             "In attesa di chiamate..."
         )
 
-        while RUNNING:
+        self.keepalive_stop.clear()
+        self.link_dead.clear()
+        self.keepalive_thread = threading.Thread(
+            target=self.keepalive_loop, daemon=True)
+        self.keepalive_thread.start()
 
-            self.maintain_media()
+        try:
+            while RUNNING:
 
-            if time.time() >= self.next_refresh:
-                log("Rinnovo registrazione SIP")
-                # Re-REGISTER sul medesimo socket TLS: nessun buco volontario.
-                self.register()
-                log("Rinnovo completato sulla stessa connessione TLS")
+                if self.link_dead.is_set():
+                    raise ConnectionError("connessione SIP caduta (keepalive)")
 
-            try:
-                raw = self.stream.read_message(
-                    timeout=5
-                )
+                self.maintain_media()
 
-            except socket.timeout:
-                continue
+                if time.time() >= self.next_refresh:
+                    log("Rinnovo registrazione SIP")
+                    # Re-REGISTER sul medesimo socket TLS: nessun buco volontario.
+                    self.register()
+                    log("Rinnovo completato sulla stessa connessione TLS")
 
-            first = sip_first_line(raw)
-
-            if first.startswith("SIP/2.0"):
-                log(f"SIP response inattesa: {first}")
                 try:
-                    path = self.save_raw(raw, "RESPONSE")
-                    log(f"Segnalazione successiva salvata: {path.name}")
-                except Exception as exc:
-                    log(f"Impossibile salvare response: {exc}")
-                continue
+                    raw = self.stream.read_message(
+                        timeout=5
+                    )
 
-            self.handle_request(raw)
+                except socket.timeout:
+                    continue
+
+                if not raw.strip():
+                    continue
+
+                first = sip_first_line(raw)
+
+                if first.startswith("SIP/2.0"):
+                    log(f"SIP response inattesa: {first}")
+                    try:
+                        path = self.save_raw(raw, "RESPONSE")
+                        log(f"Segnalazione successiva salvata: {path.name}")
+                    except Exception as exc:
+                        log(f"Impossibile salvare response: {exc}")
+                    continue
+
+                self.handle_request(raw)
+        finally:
+            self.keepalive_stop.set()
 
 
     def close(self):
+        self.keepalive_stop.set()
         for capture in list(self.media.values()):
             capture.stop("connessione SIP chiusa")
         self.media.clear()
