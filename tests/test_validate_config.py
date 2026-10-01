@@ -57,6 +57,84 @@ class ValidateConfigTests(unittest.TestCase):
                 validate(config)
             self.assertNotIn("private-secret-name", str(caught.exception))
 
+    def write_validated(self, root, data):
+        config = root / "config.json"
+        config.write_text(json.dumps(data))
+        with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"):
+            return validate(config)
+
+    def test_mqtt_enabled_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["mqtt"] = {"enabled": True, "host": "198.51.100.20",
+                            "port": 1883, "topic": "bticino/citofono/ring"}
+            self.assertEqual(self.write_validated(root, data)["mqtt"]["port"], 1883)
+
+    def test_mqtt_enabled_without_host_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["mqtt"] = {"enabled": True, "host": "", "topic": "t"}
+            config = root / "config.json"
+            config.write_text(json.dumps(data))
+            with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"), \
+                    self.assertRaisesRegex(ValueError, "mqtt.host"):
+                validate(config)
+
+    def test_mqtt_password_without_username_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pwd = root / "mqtt.pwd"
+            pwd.write_text("secret")
+            data = self.make_config(root)
+            data["mqtt"] = {"enabled": True, "host": "198.51.100.20",
+                            "topic": "t", "password_file": str(pwd)}
+            config = root / "config.json"
+            config.write_text(json.dumps(data))
+            with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"), \
+                    self.assertRaisesRegex(ValueError, "mqtt.username"):
+                validate(config)
+
+    def test_opener_enabled_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["opener"] = {"enabled": True, "entrance": "2", "cid": 0}
+            self.assertEqual(
+                self.write_validated(root, data)["opener"]["entrance"], "2")
+
+    def test_opener_enabled_without_entrance_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["opener"] = {"enabled": True, "entrance": ""}
+            config = root / "config.json"
+            config.write_text(json.dumps(data))
+            with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"), \
+                    self.assertRaisesRegex(ValueError, "opener.entrance"):
+                validate(config)
+
+    def test_lan_bind_without_token_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["http_bind"] = "0.0.0.0"
+            data["opener"] = {"enabled": True, "entrance": "2"}
+            config = root / "config.json"
+            config.write_text(json.dumps(data))
+            with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"), \
+                    self.assertRaisesRegex(ValueError, "opener.token"):
+                validate(config)
+
+    def test_lan_bind_with_token_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["http_bind"] = "0.0.0.0"
+            data["opener"] = {"enabled": True, "entrance": "2", "token": "s3cret"}
+            self.assertEqual(self.write_validated(root, data)["http_bind"], "0.0.0.0")
+
 
 if __name__ == "__main__":
     unittest.main()

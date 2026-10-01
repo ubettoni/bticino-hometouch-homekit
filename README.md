@@ -19,8 +19,9 @@ forwards live video to Homebridge on the local loopback interface.
 
 > **Project status: experimental.** Incoming video works on the tested system.
 > Local entrance classification and post-call snapshot fallback are available
-> experimentally. On-demand activation, two-way audio and entrance-specific
-> opening controls are still under development.
+> experimentally. Gate opening via SIP MESSAGE and MQTT ring notifications are
+> implemented experimentally and verified on one HOMETOUCH installation (single
+> entrance). On-demand video activation and two-way audio remain future work.
 
 ## Support the project
 
@@ -39,11 +40,14 @@ optional and do not include rewards or support services.
 | `100 Trying` / `183 Session Progress` without answering | Verified on one HOMETOUCH installation |
 | H.264 SRTP/SDES snapshot and short live early media | Verified on one HOMETOUCH installation |
 | HomeKit doorbell notification through Homebridge | Verified on one HOMETOUCH installation |
+| MQTT ring notification (`mqtt` block, no extra dependencies) | Implemented; verified on one installation |
+| Gate opening via out-of-dialog SIP MESSAGE (`*8*19/*8*20`, `src/bticino_opener.py`) | Implemented experimentally; verified on one installation, single entrance (`entrance: "2"`) |
+| Local HTTP opener endpoint (`POST /open`, token-protected on LAN) | Implemented; verified on one installation |
 | Creation of a fresh SIP endpoint and certificate | Implemented and simulated; live verification still required |
 | Continuous last-snapshot fallback after the incoming call ends | Implemented; broader HomeKit testing required |
 | Privacy-preserving multi-entrance classification | Implemented experimentally; requires local calibration |
 | True on-demand live video without an incoming call | Not implemented |
-| Two-way audio and entrance-specific opening controls | Not implemented |
+| Two-way audio | Not implemented |
 
 This is suitable for technically experienced testers, not yet a turnkey
 consumer installation. A spare HOMETOUCH SIP endpoint slot is required.
@@ -184,6 +188,50 @@ The runtime directory and executable paths are configurable. The example uses
 `/opt/bticino-sniffer`; adapt `base_dir`, `ffmpeg` and `openssl` to the host.
 Read `SECURITY.md` before collecting or sharing diagnostic data.
 
+### MQTT ring notifications
+
+When `mqtt.enabled` is `true`, every accepted incoming call publishes a JSON
+message such as `{"event":"ring","timestamp":"...","doorbell":"Videocitofono",
+"call":"<privacy-hash>"}` to `mqtt.topic`. The publisher is dependency-free
+(raw MQTT 3.1.1 over sockets) and never blocks the SIP loop; failures are only
+logged as `MQTT: invio fallito`. Use `scripts/mqtt_test.py` to verify the
+broker path without ringing:
+```sh
+python3 scripts/mqtt_test.py --host BROKER --topic bticino/citofono/ring \
+  --message '{"event":"test"}' --username USER --password 'PASS'
+```
+See `docs/home-automation.md` for the Home Assistant wiring.
+
+### Gate opener
+
+`src/bticino_opener.py` reproduces the official app's activation flow
+(`Door Entry for HOMETOUCH` 1.9.2, `performActivationAction`): two out-of-dialog
+SIP MESSAGE (`text/plain`) to `sip:MHT@<sip_domain>`, first `*8*19*<entrance>##`
+then `*8*20*<entrance>##` (entrance panels reporting CID 2009 use `*8*21` /
+`*8*22`; set `opener.cid` to `2009`). Digest `401`/`407` challenges are answered
+with the correct `Authorization` / `Proxy-Authorization` header, including the
+`opaque` echo and `stale`-nonce retry. The opener opens its own TLS connection,
+so it never interferes with the listener loop.
+
+The `entrance` (WHERE) is installation-specific: the app default is `"4"`.
+Find yours with someone at the gate:
+```sh
+python3 src/bticino_opener.py --probe 1,2,3,4,5,6,7,8,9,20
+# or: --cid 2009 --probe 1,2,3,4,5,20
+```
+then store it in `opener.entrance` and re-test with
+`python3 src/bticino_opener.py --yes` (or `--dry-run` for a preview).
+
+When the listener runs, `POST http://127.0.0.1:8766/open` triggers the same
+flow asynchronously (`202 triggered`, `503 disabled`, `403 forbidden`).
+Set `http_bind` to `0.0.0.0` to reach it from other LAN hosts; a non-loopback
+bind requires `opener.token`, passed as `?token=` or `X-Opener-Token`
+(`validate_config.py` enforces this). Never expose this endpoint to the
+internet: it moves a physical gate.
+
+Full Home Assistant wiring (notifications, snapshot, reply button, Lovelace
+button, Apple Home switch) is documented in `docs/home-automation.md`.
+
 ### Cross-platform listener
 
 The listener is ordinary Python and can be started directly on a compatible
@@ -271,21 +319,31 @@ HOMETOUCH -- H.264/SRTP --> listener/FFmpeg
 listener -- MPEG-TS/UDP loopback --> Homebridge
 listener -- JPEG/HTTP loopback --> Homebridge
 listener -- continuous latest-snapshot video fallback --> Homebridge
+listener -- MQTT ring event --> Home Assistant / automations
+Home Assistant -- HTTP POST /open --> listener -- SIP MESSAGE --> HOMETOUCH (gate)
 Homebridge -- HomeKit Secure RTP --> Apple Home
 ```
+
+> HomeKit doorbell note: the `Camera-ffmpeg` platform must define
+> `"porthttp": 8767` (plus `"localhttp": true`), otherwise its HTTP automation
+> server never starts and the listener logs `HOMEKIT DOORBELL: invio fallito:
+> ... Connection refused`. `scripts/configure_homebridge.py --apply` now ensures
+> both keys even on pre-existing platforms.
 
 ## Roadmap
 
 - Measure and harden immediate keyframe requests across installations
 - Replace the prototype scripts with a packaged service and guided installer
 - Verify dedicated-account provisioning end-to-end on additional installations
+- Validate the SIP MESSAGE opener and entrance auto-detection across more
+  installations (multi-entrance panels, CID 2009 variants)
+- Expose the opener as a native HomeKit lock/switch where HomeKit allows
 - Identify multiple entrance panels without relying on random RTP SSRC values
 - Validate privacy-preserving local visual entrance classification across more
   installations before using it by default for entrance-specific HomeKit events
 - Add on-demand video activation
 - Validate the continuous latest-snapshot fallback across additional HomeKit clients
 - Add receive-only audio, followed by carefully tested two-way audio
-- Associate the correct opening control with each entrance where HomeKit allows
 
 ## Disclaimer
 

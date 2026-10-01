@@ -89,10 +89,27 @@ INTERNAL_MEDIA_PORT_START = 22202
 INTERNAL_MEDIA_PORT_END = 22213
 LIVE_VIDEO_HOST = "127.0.0.1"
 LIVE_VIDEO_PORT = 22300
-SNAPSHOT_HTTP_HOST = "127.0.0.1"
+SNAPSHOT_HTTP_HOST = str(CONFIG.get("http_bind", "127.0.0.1")).strip() or "127.0.0.1"
 SNAPSHOT_HTTP_PORT = 8766
+OPENER_RAW = CONFIG.get("opener", {})
+OPENER_OPTS = OPENER_RAW if isinstance(OPENER_RAW, dict) else {}
+OPENER_TOKEN = str(OPENER_OPTS.get("token", "") or "")
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 HOMEBRIDGE_HTTP_PORT = 8767
 HOMEBRIDGE_DOORBELL_NAME = CONFIG.get("homekit_doorbell_name", "Videocitofono")
+MQTT_RAW = CONFIG.get("mqtt", {})
+MQTT = MQTT_RAW if isinstance(MQTT_RAW, dict) else {}
+MQTT_ENABLED = bool(MQTT.get("enabled", False))
+MQTT_HOST = str(MQTT.get("host", "")).strip()
+MQTT_PORT = int(MQTT.get("port", 1883))
+MQTT_TOPIC = str(MQTT.get("topic", "bticino/citofono/ring")).strip() or "bticino/citofono/ring"
+MQTT_CLIENT_ID = str(MQTT.get("client_id", "bticino-hometouch")).strip() or "bticino-hometouch"
+MQTT_USERNAME = str(MQTT.get("username", "") or "").strip() or None
+MQTT_PASSWORD_FILE = str(MQTT.get("password_file", "") or "").strip() or None
+MQTT_USE_TLS = bool(MQTT.get("use_tls", False))
+MQTT_RETAIN = bool(MQTT.get("retain", False))
+MQTT_QOS = 0
+MQTT_TIMEOUT = float(MQTT.get("timeout", 5.0))
 PLACEHOLDER_SNAPSHOT = RUNTIME_DIR / "snapshot-pending.jpg"
 SAVE_RAW_SIP = bool(CONFIG.get("save_raw_sip", False))
 POST_CALL_FALLBACK_SECONDS = int(CONFIG.get("post_call_fallback_seconds", -1))
@@ -446,8 +463,59 @@ class SnapshotHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_POST(self):
+        if self.path.split("?", 1)[0] != "/open":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 0:
+            self.rfile.read(min(length, 4096))
+        try:
+            from bticino_opener import opener_settings
+            enabled = opener_settings().get("enabled", False)
+        except Exception:
+            enabled = False
+        if not enabled:
+            self._open_reply(503, {"status": "disabled"})
+            return
+        if not self._open_authorized():
+            self._open_reply(403, {"status": "forbidden"})
+            log("OPENER: token mancante/errato")
+            return
+        threading.Thread(target=trigger_gate_open, daemon=True).start()
+        self._open_reply(202, {"status": "triggered"})
+
+    def _open_authorized(self):
+        """Token obbligatorio se l'ascolto non è solo loopback."""
+        if SNAPSHOT_HTTP_HOST in LOOPBACK_HOSTS and not OPENER_TOKEN:
+            return True
+        if not OPENER_TOKEN:
+            return False
+        from urllib.parse import parse_qs, urlsplit
+        query = parse_qs(urlsplit(self.path).query)
+        provided = query.get("token", [""])[0] or self.headers.get("X-Opener-Token", "")
+        return hmac.compare_digest(provided, OPENER_TOKEN)
+
+    def _open_reply(self, code, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def log_message(self, fmt, *args):
         return
+
+
+def trigger_gate_open():
+    """Esegue l'apertura cancellino su connessione TLS dedicata."""
+    try:
+        from bticino_opener import open_gate
+        ok, detail = open_gate()
+        log(f"OPENER: {'OK' if ok else 'FAIL'} {detail}")
+    except Exception as exc:
+        log(f"OPENER: errore {type(exc).__name__}: {exc}")
 
 
 def start_snapshot_server():
@@ -456,6 +524,8 @@ def start_snapshot_server():
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log(f"Snapshot HTTP locale: http://{SNAPSHOT_HTTP_HOST}:{SNAPSHOT_HTTP_PORT}/snapshot.jpg")
+    if SNAPSHOT_HTTP_HOST not in LOOPBACK_HOSTS:
+        log("HTTP: ascolto su LAN, /open richiede token")
     return server
 
 
@@ -470,6 +540,136 @@ def ring_homekit_doorbell():
         log("HOMEKIT DOORBELL: evento inviato")
     except Exception as exc:
         log(f"HOMEKIT DOORBELL: invio fallito: {type(exc).__name__}: {exc}")
+
+
+def _mqtt_encode_remaining_length(length):
+    if length < 0 or length > 268435455:
+        raise ValueError("lunghezza MQTT non valida")
+    encoded = bytearray()
+    while True:
+        digit = length % 128
+        length //= 128
+        if length > 0:
+            digit |= 0x80
+        encoded.append(digit)
+        if length == 0:
+            break
+    return bytes(encoded)
+
+
+def _mqtt_pack_str(value):
+    raw = value.encode("utf-8")
+    if len(raw) > 0xFFFF:
+        raise ValueError("stringa MQTT troppo lunga")
+    return len(raw).to_bytes(2, "big") + raw
+
+
+def _mqtt_read_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("connessione MQTT chiusa")
+        data += chunk
+    return data
+
+
+def _mqtt_publish_once(topic, payload, retain=False):
+    """Publish QoS0 senza dipendenze esterne (MQTT 3.1.1)."""
+    if not MQTT_HOST:
+        raise RuntimeError("mqtt.host non configurato")
+    password = None
+    if MQTT_PASSWORD_FILE:
+        try:
+            password = Path(MQTT_PASSWORD_FILE).expanduser().read_text(
+                encoding="utf-8"
+            ).strip() or None
+        except OSError as exc:
+            raise RuntimeError(f"password_file illeggibile: {exc}") from exc
+    raw_sock = socket.create_connection(
+        (MQTT_HOST, MQTT_PORT), timeout=max(1.0, MQTT_TIMEOUT)
+    )
+    sock = raw_sock
+    try:
+        sock.settimeout(max(1.0, MQTT_TIMEOUT))
+        if MQTT_USE_TLS:
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(sock, server_hostname=MQTT_HOST)
+        client_id = (MQTT_CLIENT_ID or f"bticino-{uuid.uuid4().hex[:8]}")[:23]
+        flags = 0x02  # clean session
+        if MQTT_USERNAME:
+            flags |= 0x80
+        if password is not None:
+            if not MQTT_USERNAME:
+                raise RuntimeError("mqtt.password_file senza mqtt.username")
+            flags |= 0x40
+        body = (
+            _mqtt_pack_str("MQTT")
+            + bytes((0x04, flags, 0x00, 0x3C))
+            + _mqtt_pack_str(client_id)
+        )
+        if MQTT_USERNAME:
+            body += _mqtt_pack_str(MQTT_USERNAME)
+        if password is not None:
+            body += _mqtt_pack_str(password)
+        sock.sendall(
+            bytes((0x10,)) + _mqtt_encode_remaining_length(len(body)) + body
+        )
+        header = _mqtt_read_exact(sock, 4)
+        if header[0] != 0x20 or header[1] != 0x02 or header[3] != 0x00:
+            raise RuntimeError(f"CONNACK rifiutato: rc={header[3]}")
+        topic_raw = topic.encode("utf-8")
+        if not topic_raw or len(topic_raw) > 0xFFFF:
+            raise ValueError("topic MQTT non valido")
+        publish_body = (
+            len(topic_raw).to_bytes(2, "big") + topic_raw + payload
+        )
+        fixed = 0x30 | (0x01 if retain else 0x00)
+        sock.sendall(
+            bytes((fixed,))
+            + _mqtt_encode_remaining_length(len(publish_body))
+            + publish_body
+        )
+        try:
+            sock.sendall(b"\xe0\x00")
+        except OSError:
+            pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def publish_mqtt_ring(call_id):
+    """Posta un JSON di chiamata sul topic configurato, senza bloccare SIP."""
+    if not MQTT_ENABLED:
+        return
+    try:
+        payload = json.dumps(
+            {
+                "event": "ring",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "doorbell": HOMEBRIDGE_DOORBELL_NAME,
+                "call": call_reference(call_id),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        _mqtt_publish_once(MQTT_TOPIC, payload, retain=MQTT_RETAIN)
+        log(f"MQTT: ring pubblicato su {MQTT_HOST}:{MQTT_PORT} topic={MQTT_TOPIC}")
+    except Exception as exc:
+        # Mai stampare username/password/topic sensibili oltre il nome topic.
+        log(f"MQTT: invio fallito: {type(exc).__name__}: {exc}")
+
+
+def notify_incoming_call(call_id):
+    """Notifica HomeKit + MQTT in parallelo, senza bloccare il loop SIP."""
+    threading.Thread(target=ring_homekit_doorbell, daemon=True).start()
+    if MQTT_ENABLED:
+        threading.Thread(
+            target=publish_mqtt_ring, args=(call_id,), daemon=True
+        ).start()
 
 
 def md5(text):
@@ -1486,7 +1686,7 @@ class HomtouchListener:
         )
         # HomeKit deve notificare subito; la snapshot pulita continua a essere
         # generata in parallelo e sostituisce automaticamente quella precedente.
-        threading.Thread(target=ring_homekit_doorbell, daemon=True).start()
+        notify_incoming_call(call_id)
 
 
     def maintain_media(self):
@@ -1773,6 +1973,10 @@ def main():
         f"Domain: {DOMAIN}"
     )
     log(f"Pool RTP/RTCP: UDP {MEDIA_PORT_START}-{MEDIA_PORT_END}")
+    if MQTT_ENABLED:
+        log(f"MQTT: attivo verso {MQTT_HOST}:{MQTT_PORT} topic={MQTT_TOPIC}")
+    else:
+        log("MQTT: disabilitato")
     if ENTRANCE_CLASSIFICATION_ENABLED:
         log(f"Classificazione ingressi diagnostica: {len(ENTRANCE_PROFILES)} profili, frame={ENTRANCE_CLASSIFICATION_FRAME}")
     log("=" * 70)

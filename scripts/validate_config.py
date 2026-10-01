@@ -70,6 +70,50 @@ def validate(path):
 
     resolve_executable(data.get("ffmpeg"), "ffmpeg")
     resolve_executable(data.get("openssl"), "openssl")
+    opener = data.get("opener", {})
+    if opener and not isinstance(opener, dict):
+        raise ValueError("opener deve essere un oggetto")
+    if isinstance(opener, dict) and opener.get("enabled", False):
+        entrance = str(opener.get("entrance", "") or "").strip()
+        if not entrance:
+            raise ValueError("opener.entrance mancante (es. 4)")
+        try:
+            int(opener.get("cid", 0))
+        except (TypeError, ValueError):
+            raise ValueError("opener.cid deve essere un intero")
+        timeout = opener.get("timeout", 10.0)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("opener.timeout deve essere positivo")
+    bind = str(data.get("http_bind", "127.0.0.1") or "127.0.0.1").strip()
+    if bind not in ("127.0.0.1", "::1", "localhost"):
+        token = ""
+        if isinstance(opener, dict):
+            token = str(opener.get("token", "") or "")
+        if not token:
+            raise ValueError("http_bind su LAN richiede opener.token")
+    mqtt = data.get("mqtt", {})
+    if mqtt and not isinstance(mqtt, dict):
+        raise ValueError("mqtt deve essere un oggetto")
+    if isinstance(mqtt, dict) and mqtt.get("enabled", False):
+        host = mqtt.get("host", "")
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("mqtt.host mancante (broker MQTT)")
+        if any(marker in host for marker in PLACEHOLDERS):
+            raise ValueError("sostituire il valore di esempio: mqtt.host")
+        port = mqtt.get("port", 1883)
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("mqtt.port deve essere compreso tra 1 e 65535")
+        topic = mqtt.get("topic", "")
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValueError("mqtt.topic mancante")
+        password_file = mqtt.get("password_file", "")
+        if isinstance(password_file, str) and password_file.strip():
+            if any(marker in password_file for marker in PLACEHOLDERS):
+                raise ValueError("sostituire il valore di esempio: mqtt.password_file")
+            if not Path(password_file).expanduser().is_file():
+                raise ValueError("file richiesto non trovato: mqtt.password_file")
+            if mqtt.get("username", "") in (None, ""):
+                raise ValueError("mqtt.username richiesto con password_file")
     classification = data.get("entrance_classification", {})
     if classification and not isinstance(classification, dict):
         raise ValueError("entrance_classification deve essere un oggetto")

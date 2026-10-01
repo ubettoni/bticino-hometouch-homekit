@@ -45,6 +45,8 @@ if platform is None:
     }
     platforms.append(platform)
 platform["videoProcessor"] = ffmpeg
+platform.setdefault("porthttp", 8767)
+platform.setdefault("localhttp", True)
 
 camera = {
         "name": "Videocitofono",

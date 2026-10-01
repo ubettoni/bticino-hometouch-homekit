@@ -13,6 +13,27 @@
   "private_key_file": "/path/to/client.key",
   "ca_file": "/path/to/ca-chain.cert.pem",
   "homekit_doorbell_name": "Videocitofono",
+  "http_bind": "127.0.0.1",
+  "opener": {
+    "enabled": false,
+    "entrance": "4",
+    "cid": 0,
+    "destination": "",
+    "timeout": 10.0,
+    "token": ""
+  },
+  "mqtt": {
+    "enabled": false,
+    "host": "192.0.2.20",
+    "port": 1883,
+    "topic": "bticino/citofono/ring",
+    "client_id": "bticino-hometouch",
+    "username": "",
+    "password_file": "/path/to/mqtt_password.txt",
+    "use_tls": false,
+    "retain": false,
+    "timeout": 5.0
+  },
   "post_call_fallback_seconds": -1,
   "entrance_classification": {
     "enabled": false,
