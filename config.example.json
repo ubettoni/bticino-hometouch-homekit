@@ -5,6 +5,8 @@
   "sip_server": "192.0.2.10",
   "sip_port": 5061,
   "sip_domain": "example.invalid",
+  "media_ip": "",
+  "media_ports": "2202-2213",
   "reconnect_initial_delay": 0.25,
   "reconnect_max_delay": 10.0,
   "reconnect_stable_after": 30.0,

@@ -184,6 +184,10 @@ continues serving the most recent private snapshot after a call ends. This can
 prevent an older HomeKit notification from becoming blank, but it is not live
 video: true on-demand activation of the HOMETOUCH camera remains future work.
 
+Keyframe requests use authenticated SRTCP PLI plus FIR (RFC 5104), repeated
+every few seconds until the first snapshot lands, because panels behind a
+cloud relay may only emit delta frames until asked.
+
 The runtime directory and executable paths are configurable. The example uses
 `/opt/bticino-sniffer`; adapt `base_dir`, `ffmpeg` and `openssl` to the host.
 Read `SECURITY.md` before collecting or sharing diagnostic data.
@@ -250,6 +254,22 @@ If the router/firewall silently drops the idle mapping, the server cannot push
 `REGISTER` refresh timeouts followed by reconnects, with no `SIP RX: INVITE`
 in between. The keepalive thread detects a dead link on write failure and
 forces an immediate reconnect instead of waiting for the next refresh.
+
+Media from the entrance panel/gateway arrives directly over UDP. If the SDP
+offer carries a public/cloud connection address, the bridge must answer with a
+reachable one: set `media_ip` to your public IP or DDNS name (resolved at every
+call, so dynamic DNS is fine) and forward the UDP media range to the bridge.
+`media_ports` (default `"2202-2213"`) restricts the RTP/RTCP pool, e.g.
+`"2202-2203"` for a single pair behind a proxy — only the even RTP port is
+strictly required for snapshots, RTCP is best-effort, and audio (diagnostic
+only) is dropped if no pair is left. Example nginx UDP forward:
+
+```nginx
+stream {
+  server { listen 2202 udp; proxy_pass 192.168.1.52:2202; }
+  server { listen 2203 udp; proxy_pass 192.168.1.52:2203; }
+}
+```
 
 ### Cross-platform listener
 

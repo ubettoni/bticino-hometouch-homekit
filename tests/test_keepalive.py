@@ -78,5 +78,26 @@ class InstanceUuidTests(unittest.TestCase):
         self.assertNotEqual(value, "not-a-uuid")
 
 
+class MediaPortsTests(unittest.TestCase):
+    def test_default_range(self):
+        self.assertEqual(MODULE.parse_media_ports(None), (2202, 2213))
+        self.assertEqual(MODULE.parse_media_ports(""), (2202, 2213))
+
+    def test_single_pair(self):
+        self.assertEqual(MODULE.parse_media_ports("2202-2203"), (2202, 2203))
+
+    def test_rejects_odd_start(self):
+        with self.assertRaises(ValueError):
+            MODULE.parse_media_ports("2203-2204")
+
+    def test_rejects_inverted(self):
+        with self.assertRaises(ValueError):
+            MODULE.parse_media_ports("2212-2202")
+
+    def test_rejects_garbage(self):
+        with self.assertRaises(ValueError):
+            MODULE.parse_media_ports("2202")
+
+
 if __name__ == "__main__":
     unittest.main()

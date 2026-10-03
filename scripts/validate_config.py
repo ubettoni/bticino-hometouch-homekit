@@ -49,6 +49,27 @@ def validate(path):
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("sip_port deve essere compreso tra 1 e 65535")
 
+    media_ip = str(data.get("media_ip", "") or "").strip()
+    if media_ip:
+        import ipaddress
+        import re as _re
+        try:
+            ipaddress.ip_address(media_ip)
+        except ValueError:
+            if not _re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?",
+                                 media_ip):
+                raise ValueError("media_ip non valido") from None
+    ports = str(data.get("media_ports", "") or "").strip() or "2202-2213"
+    import re as _re2
+    _m = _re2.fullmatch(r"(\d{1,5})\s*-\s*(\d{1,5})", ports)
+    if not _m:
+        raise ValueError("media_ports deve essere 'START-END' (es. 2202-2203)")
+    _s, _e = int(_m.group(1)), int(_m.group(2))
+    if not 1 <= _s <= 65535 or not 1 <= _e <= 65535:
+        raise ValueError("media_ports fuori range 1-65535")
+    if _s % 2 != 0 or _e <= _s:
+        raise ValueError("media_ports: START pari e minore di END")
+
     for key in ("credentials_file", "certificate_file", "private_key_file", "ca_file"):
         if not Path(data[key]).expanduser().is_file():
             raise ValueError(f"file richiesto non trovato: {key}")

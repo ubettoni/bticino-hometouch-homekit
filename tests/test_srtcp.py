@@ -27,6 +27,19 @@ class SrtcpTests(unittest.TestCase):
         self.assertEqual(len(packet[-10:]), 10)
         self.assertNotIn(material, packet)
 
+    def test_srtcp_fir_shape_rfc5104(self):
+        from unittest.mock import patch
+        material = bytes(range(30))
+        with patch.object(MODULE, "aes_cm_prf", return_value=bytes(20)):
+            packet = MODULE.make_srtcp_fir(material, 0x11223344, 0x55667788,
+                                           seq=7)
+        self.assertTrue(packet.startswith(bytes.fromhex("80c9000111223344")))
+        # PSFB FMT=4, 4 words: sender + media + seqentry
+        self.assertIn(bytes.fromhex("84ce0004112233445566778807000000"), packet)
+        self.assertEqual(packet[-14:-10], bytes(4))
+        self.assertEqual(len(packet[-10:]), 10)
+        self.assertNotIn(material, packet)
+
 
 if __name__ == "__main__":
     unittest.main()

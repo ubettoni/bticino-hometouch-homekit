@@ -115,6 +115,25 @@ class ValidateConfigTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "opener.entrance"):
                 validate(config)
 
+    def test_media_ports_single_pair_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["media_ports"] = "2202-2203"
+            self.assertEqual(
+                self.write_validated(root, data)["media_ports"], "2202-2203")
+
+    def test_media_ports_odd_start_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["media_ports"] = "2203-2204"
+            config = root / "config.json"
+            config.write_text(json.dumps(data))
+            with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"), \
+                    self.assertRaisesRegex(ValueError, "media_ports"):
+                validate(config)
+
     def test_lan_bind_without_token_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -29,6 +29,12 @@ Find your `entrance` first (someone at the gate):
 python3 src/bticino_opener.py --probe 1,2,3,4,5,6,7,8,9,20
 ```
 
+If the panel sends media from a public/cloud address (check the SDP `c=` line
+of a saved `INVITE`), set `media_ip` to your public IP or DDNS name and forward
+UDP `media_ports` (default `2202-2213`, or `"2202-2203"` for a single pair) to
+the bridge host. Otherwise the bridge advertises an unreachable LAN address
+and no RTP/RTCP packet ever arrives (`audio_udp=0`, FFmpeg demux timeout).
+
 ## 1. Same MQTT broker everywhere
 
 Home Assistant must use the **same** broker as the bridge
