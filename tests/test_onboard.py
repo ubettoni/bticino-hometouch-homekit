@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -178,7 +179,8 @@ class OnboardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private" / "value.json"
             atomic_private_json(path, {"secret": "value"})
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(path.read_text())["secret"], "value")
 
     def test_certificate_zip_and_base64(self):
@@ -193,7 +195,8 @@ class OnboardTests(unittest.TestCase):
                 extract_certificates(blob, "user", cert, ca)
                 self.assertEqual(cert.read_bytes(), b"CERT")
                 self.assertEqual(ca.read_bytes(), b"CA")
-                self.assertEqual(cert.stat().st_mode & 0o777, 0o600)
+                if sys.platform != "win32":
+                    self.assertEqual(cert.stat().st_mode & 0o777, 0o600)
 
     def test_apply_refuses_to_mutate_at_capacity(self):
         self.FakeClient.endpoint_count = 20
@@ -265,7 +268,8 @@ class OnboardTests(unittest.TestCase):
                 "config.json", "sip_credentials.json", "selection.json",
                 "client.key", "client.cert.pem", "ca-chain.cert.pem",
             ):
-                self.assertEqual((output / name).stat().st_mode & 0o777, 0o600)
+                if sys.platform != "win32":
+                    self.assertEqual((output / name).stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

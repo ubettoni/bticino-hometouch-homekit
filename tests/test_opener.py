@@ -121,6 +121,27 @@ class MqttEncodingTests(unittest.TestCase):
     def test_mqtt_disabled_by_default(self):
         self.assertFalse(LISTENER.MQTT_ENABLED)
 
+    def test_publish_event_payload(self):
+        import json
+        import secrets
+        sent = {}
+
+        def fake_publish(topic, payload, retain=False):
+            sent["topic"] = topic
+            sent["payload"] = json.loads(payload.decode())
+            sent["retain"] = retain
+
+        LISTENER.DIAGNOSTIC_KEY = secrets.token_bytes(32)
+        with patch.object(LISTENER, "MQTT_ENABLED", True), \
+             patch.object(LISTENER, "MQTT_TOPIC", "t/ring"), \
+             patch.object(LISTENER, "_mqtt_publish_once", fake_publish), \
+             patch.object(LISTENER, "log", lambda *a: None):
+            LISTENER.publish_mqtt_event("call-1", "snapshot_ready")
+        self.assertEqual(sent["topic"], "t/ring")
+        self.assertEqual(sent["payload"]["event"], "snapshot_ready")
+        self.assertEqual(sent["payload"]["call"],
+                         LISTENER.call_reference("call-1"))
+
 
 if __name__ == "__main__":
     unittest.main()

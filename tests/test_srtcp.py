@@ -27,6 +27,16 @@ class SrtcpTests(unittest.TestCase):
         self.assertEqual(len(packet[-10:]), 10)
         self.assertNotIn(material, packet)
 
+    def test_srtcp_index_advances_replay_protection(self):
+        from unittest.mock import patch
+        material = bytes(range(30))
+        with patch.object(MODULE, "aes_cm_prf", return_value=bytes(20)):
+            first = MODULE.make_srtcp_pli(material, 1, 2, index=0)
+            second = MODULE.make_srtcp_pli(material, 1, 2, index=1)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first[-14:-10], (0).to_bytes(4, "big"))
+        self.assertEqual(second[-14:-10], (1).to_bytes(4, "big"))
+
     def test_srtcp_fir_shape_rfc5104(self):
         from unittest.mock import patch
         material = bytes(range(30))

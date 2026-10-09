@@ -106,6 +106,15 @@ def validate(path):
         if not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ValueError("opener.timeout deve essere positivo")
     bind = str(data.get("http_bind", "127.0.0.1") or "127.0.0.1").strip()
+    if "answer_calls" in data and not isinstance(data["answer_calls"], bool):
+        raise ValueError("answer_calls deve essere true o false")
+    if "doorbell_snapshot_timeout" in data:
+        try:
+            timeout = float(data["doorbell_snapshot_timeout"])
+        except (TypeError, ValueError):
+            raise ValueError("doorbell_snapshot_timeout deve essere un numero") from None
+        if timeout < 0:
+            raise ValueError("doorbell_snapshot_timeout non puo' essere negativo")
     if bind not in ("127.0.0.1", "::1", "localhost"):
         token = ""
         if isinstance(opener, dict):

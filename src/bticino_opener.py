@@ -174,13 +174,18 @@ class SipChannel:
 
     def _read_message(self):
         deadline = time.time() + self.timeout
-        while b"\r\n\r\n" not in self.buf:
-            if time.time() > deadline:
-                raise TimeoutError("timeout risposta SIP")
-            chunk = self.sock.recv(16384)
-            if not chunk:
-                raise ConnectionError("connessione SIP chiusa")
-            self.buf += chunk
+        while True:
+            while b"\r\n\r\n" not in self.buf:
+                if time.time() > deadline:
+                    raise TimeoutError("timeout risposta SIP")
+                chunk = self.sock.recv(16384)
+                if not chunk:
+                    raise ConnectionError("connessione SIP chiusa")
+                self.buf += chunk
+            # Scarta eventuali CRLF di keepalive in arrivo (RFC 5626).
+            self.buf = self.buf.lstrip(b"\r\n")
+            if b"\r\n\r\n" in self.buf:
+                break
         head_end = self.buf.index(b"\r\n\r\n") + 4
         import re as _re
         m = _re.search(r"(?im)^Content-Length\s*:\s*(\d+)\s*$",

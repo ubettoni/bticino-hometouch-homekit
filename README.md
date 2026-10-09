@@ -188,6 +188,11 @@ Keyframe requests use authenticated SRTCP PLI plus FIR (RFC 5104), repeated
 every few seconds until the first snapshot lands, because panels behind a
 cloud relay may only emit delta frames until asked.
 
+If repeated PLI+FIR still yields no keyframe, the panel may gate IDR pictures
+on call answer: set `"answer_calls": true` for a diagnostic test (the bridge
+then sends `200 OK` after `183`). Warning: answering may make the other indoor
+stations stop ringing, so use it only for a supervised test, never as default.
+
 The runtime directory and executable paths are configurable. The example uses
 `/opt/bticino-sniffer`; adapt `base_dir`, `ffmpeg` and `openssl` to the host.
 Read `SECURITY.md` before collecting or sharing diagnostic data.
@@ -196,7 +201,9 @@ Read `SECURITY.md` before collecting or sharing diagnostic data.
 
 When `mqtt.enabled` is `true`, every accepted incoming call publishes a JSON
 message such as `{"event":"ring","timestamp":"...","doorbell":"Videocitofono",
-"call":"<privacy-hash>"}` to `mqtt.topic`. The publisher is dependency-free
+"call":"<privacy-hash>"}` to `mqtt.topic`. A second `snapshot_ready` event
+follows once the snapshot for that call exists, so automations can wait for a
+real picture instead of the dark placeholder. The publisher is dependency-free
 (raw MQTT 3.1.1 over sockets) and never blocks the SIP loop; failures are only
 logged as `MQTT: invio fallito`. Use `scripts/mqtt_test.py` to verify the
 broker path without ringing:
@@ -254,6 +261,18 @@ If the router/firewall silently drops the idle mapping, the server cannot push
 `REGISTER` refresh timeouts followed by reconnects, with no `SIP RX: INVITE`
 in between. The keepalive thread detects a dead link on write failure and
 forces an immediate reconnect instead of waiting for the next refresh.
+
+iOS photographs `stillImageSource` at the instant the doorbell event fires, so
+an immediate ring always carries the dark placeholder (the snapshot only
+exists ~5 s later). Set `doorbell_snapshot_timeout` (seconds, `0` = off) to
+delay the HomeKit ring until the snapshot for that call exists; MQTT stays
+immediate either way. Cost: the ring notification itself arrives late.
+
+Inbound SIP hardening: retransmitted INVITEs reuse the live capture (single
+183 re-sent, no duplicate snapshot/ring), folded headers and non-`sip:`/`sips:`
+Contact values are rejected with `400`, unknown `BYE`s get `481`, video offers
+with out-of-range ports or unusable connection addresses are refused, and
+broken audio offers degrade to video-only instead of killing the call.
 
 Media from the entrance panel/gateway arrives directly over UDP. If the SDP
 offer carries a public/cloud connection address, the bridge must answer with a

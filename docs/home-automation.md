@@ -82,6 +82,13 @@ conditions:
   - condition: template
     value_template: "{{ trigger.payload_json.event == 'ring' }}"
 actions:
+  # Aspetta la snapshot vera (max 15 s): la notifica scattata sul ring
+  # fotograferebbe ancora il placeholder scuro. Se scade, notifica comunque.
+  - wait_for_trigger:
+      - trigger: mqtt
+        topic: bticino/citofono/ring
+    timeout: "00:00:15"
+    continue_on_timeout: true
   - action: camera.snapshot
     target:
       entity_id: camera.videocitofono
@@ -92,9 +99,19 @@ actions:
       title: "Suonano al campanello"
       message: "Chiamata al citofono {{ trigger.payload_json.timestamp }}"
       data:
-        tag: citofono
-        image: "/local/citofono.jpg"
+        # Tag unico per suonata: Apri agisce sempre sull'ultima, senza
+        # confondere anelli ravvicinati. Adatta entity_id/url ai tuoi nomi.
+        tag: "citofono_{{ now().timestamp() | int }}"
+        entity_id: camera.videocitofono
+        url: /lovelace/videocitofono
+        image: "https://TUO_HA/local/citofono.jpg"
+        push:
+          sound: default
+          interruption-level: time-sensitive
         actions:
+          - action: URI
+            title: Vedi live
+            uri: /lovelace/videocitofono
           - action: APRI_CANCELLO
             title: Apri cancellino
           - action: IGNORA

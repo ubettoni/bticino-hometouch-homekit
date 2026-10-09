@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import collections
 import hashlib
 import hmac
 import base64
@@ -18,6 +19,12 @@ import sys
 import threading
 import time
 import uuid
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    _HAS_CRYPTOGRAPHY = True
+except ImportError:
+    _HAS_CRYPTOGRAPHY = False
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -118,6 +125,8 @@ OPENER_TOKEN = str(OPENER_OPTS.get("token", "") or "")
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 HOMEBRIDGE_HTTP_PORT = 8767
 HOMEBRIDGE_DOORBELL_NAME = CONFIG.get("homekit_doorbell_name", "Videocitofono")
+DOORBELL_SNAPSHOT_TIMEOUT = float(CONFIG.get("doorbell_snapshot_timeout", 0.0))
+ANSWER_CALLS = bool(CONFIG.get("answer_calls", False))
 MQTT_RAW = CONFIG.get("mqtt", {})
 MQTT = MQTT_RAW if isinstance(MQTT_RAW, dict) else {}
 MQTT_ENABLED = bool(MQTT.get("enabled", False))
@@ -689,14 +698,14 @@ def _mqtt_publish_once(topic, payload, retain=False):
             pass
 
 
-def publish_mqtt_ring(call_id):
-    """Posta un JSON di chiamata sul topic configurato, senza bloccare SIP."""
+def publish_mqtt_event(call_id, event):
+    """Posta un evento JSON sul topic configurato, senza bloccare SIP."""
     if not MQTT_ENABLED:
         return
     try:
         payload = json.dumps(
             {
-                "event": "ring",
+                "event": event,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "doorbell": HOMEBRIDGE_DOORBELL_NAME,
                 "call": call_reference(call_id),
@@ -705,19 +714,51 @@ def publish_mqtt_ring(call_id):
             separators=(",", ":"),
         ).encode("utf-8")
         _mqtt_publish_once(MQTT_TOPIC, payload, retain=MQTT_RETAIN)
-        log(f"MQTT: ring pubblicato su {MQTT_HOST}:{MQTT_PORT} topic={MQTT_TOPIC}")
+        log(f"MQTT: {event} pubblicato su {MQTT_HOST}:{MQTT_PORT} topic={MQTT_TOPIC}")
     except Exception as exc:
         # Mai stampare username/password/topic sensibili oltre il nome topic.
         log(f"MQTT: invio fallito: {type(exc).__name__}: {exc}")
 
 
-def notify_incoming_call(call_id):
-    """Notifica HomeKit + MQTT in parallelo, senza bloccare il loop SIP."""
-    threading.Thread(target=ring_homekit_doorbell, daemon=True).start()
-    if MQTT_ENABLED:
+def publish_mqtt_ring(call_id):
+    """Posta un JSON di chiamata sul topic configurato, senza bloccare SIP."""
+    publish_mqtt_event(call_id, "ring")
+
+
+def notify_incoming_call(call_id, snapshot_path=None, started_at=0.0,
+                           doorbell_timeout=None):
+    """Notifica MQTT subito; HomeKit subito o dopo la snapshot.
+
+    iOS fotografa stillImageSource nell'istante dell'evento campanello: con
+    attesa > 0 il ring parte solo quando la snapshot della chiamata esiste
+    (foto vera invece del placeholder scuro), al costo di ritardare la
+    notifica stessa. MQTT resta immediato in entrambi i casi.
+    """
+    threading.Thread(target=publish_mqtt_ring, args=(call_id,), daemon=True).start()
+    wait = (DOORBELL_SNAPSHOT_TIMEOUT if doorbell_timeout is None
+            else doorbell_timeout)
+    if wait and wait > 0 and snapshot_path is not None:
         threading.Thread(
-            target=publish_mqtt_ring, args=(call_id,), daemon=True
+            target=ring_homekit_doorbell_delayed,
+            args=(call_id, Path(snapshot_path), started_at, wait),
+            daemon=True,
         ).start()
+    else:
+        threading.Thread(target=ring_homekit_doorbell, daemon=True).start()
+
+
+def ring_homekit_doorbell_delayed(call_id, snapshot_path, started_at, wait):
+    """Aspetta la snapshot (max `wait` s) prima di suonare in HomeKit."""
+    deadline = time.time() + max(0.0, wait)
+    while time.time() < deadline:
+        try:
+            stat = snapshot_path.stat()
+            if stat.st_size > 0 and stat.st_mtime >= started_at:
+                break
+        except OSError:
+            pass
+        time.sleep(0.5)
+    ring_homekit_doorbell()
 
 
 def md5(text):
@@ -740,6 +781,10 @@ def aes_cm_prf(master_key, master_salt, label, length):
         ((counter + i) & ((1 << 128) - 1)).to_bytes(16, "big")
         for i in range((length + 15) // 16)
     )
+    if _HAS_CRYPTOGRAPHY:
+        cipher = Cipher(algorithms.AES(master_key), modes.ECB())
+        encryptor = cipher.encryptor()
+        return (encryptor.update(blocks) + encryptor.finalize())[:length]
     result = subprocess.run(
         [OPENSSL, "enc", "-aes-128-ecb", "-K", master_key.hex(),
          "-nosalt", "-nopad"],
@@ -749,7 +794,7 @@ def aes_cm_prf(master_key, master_salt, label, length):
     return result.stdout[:length]
 
 
-def make_srtcp_pli(master_material, sender_ssrc, media_ssrc, index=0):
+def make_srtcp_pli(master_material, sender_ssrc, media_ssrc, index=0, auth_key=None):
     """Build authenticated, unencrypted compound SRTCP RR+SDES+PLI."""
     if len(master_material) != 30:
         raise ValueError("materiale SDES non valido")
@@ -773,12 +818,13 @@ def make_srtcp_pli(master_material, sender_ssrc, media_ssrc, index=0):
     plain = rr + sdes + pli
     # E=0: RTCP remains clear, but authentication is mandatory for SRTCP.
     trailer = (index & 0x7fffffff).to_bytes(4, "big")
-    auth_key = aes_cm_prf(master_material[:16], master_material[16:], 0x04, 20)
+    if auth_key is None:
+        auth_key = aes_cm_prf(master_material[:16], master_material[16:], 0x04, 20)
     tag = hmac.new(auth_key, plain + trailer, hashlib.sha1).digest()[:10]
     return plain + trailer + tag
 
 
-def make_srtcp_fir(master_material, sender_ssrc, media_ssrc, seq=0, index=0):
+def make_srtcp_fir(master_material, sender_ssrc, media_ssrc, seq=0, index=0, auth_key=None):
     """Build authenticated, unencrypted compound SRTCP RR+SDES+FIR (RFC 5104)."""
     if len(master_material) != 30:
         raise ValueError("materiale SDES non valido")
@@ -805,7 +851,8 @@ def make_srtcp_fir(master_material, sender_ssrc, media_ssrc, seq=0, index=0):
     )
     plain = rr + sdes + fir
     trailer = (index & 0x7fffffff).to_bytes(4, "big")
-    auth_key = aes_cm_prf(master_material[:16], master_material[16:], 0x04, 20)
+    if auth_key is None:
+        auth_key = aes_cm_prf(master_material[:16], master_material[16:], 0x04, 20)
     tag = hmac.new(auth_key, plain + trailer, hashlib.sha1).digest()[:10]
     return plain + trailer + tag
 
@@ -951,6 +998,32 @@ def sip_body(raw):
     return parts[1].decode("utf-8", errors="replace")
 
 
+def has_obs_fold(raw):
+    """Rileva header piegati (obs-fold): possibile vettore di injection."""
+    head = raw.split(b"\r\n\r\n", 1)[0]
+    return any(line[:1] in b" \t" for line in head.split(b"\r\n")[1:])
+
+
+def valid_sip_contact(value):
+    """Accetta solo Contact con URI sip:/sips: (anti-injection)."""
+    text = (value or "").strip()
+    if text.startswith("<"):
+        text = text[1:].split(">", 1)[0]
+    else:
+        text = text.split(";", 1)[0]
+    return text.lower().startswith(("sip:", "sips:"))
+
+
+def valid_remote_ip(value):
+    """Rifiuta loopback/unspecified/multicast/link-local per i media remoti."""
+    try:
+        parsed = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return False
+    return not (parsed.is_loopback or parsed.is_unspecified
+                or parsed.is_multicast or parsed.is_link_local)
+
+
 def sdp_value(body, prefix):
     for line in body.replace("\r", "").split("\n"):
         if line.lower().startswith(prefix.lower()):
@@ -1076,7 +1149,7 @@ class EarlyMediaCapture:
 
     def __init__(self, call_id, local_ip, local_port, internal_port, payload, fmtp,
                  remote_key, crypto_tag, media_order, audio, remote_ip,
-                 remote_rtcp_port):
+                 remote_rtp_port, remote_rtcp_port):
         self.call_id = call_id
         self.local_ip = local_ip
         self.local_port = local_port
@@ -1088,22 +1161,28 @@ class EarlyMediaCapture:
         self.media_order = media_order
         self.audio = audio
         self.remote_ip = remote_ip
+        self.remote_rtp_port = remote_rtp_port
         self.remote_rtcp_port = remote_rtcp_port
         self.audio_key = base64.b64encode(os.urandom(30)).decode("ascii")
         self.audio_sockets = []
         self.audio_packets = 0
         self.answer_key = base64.b64encode(os.urandom(30)).decode("ascii")
+        self.auth_key = None
         self.process = None
+        self.stderr_lines = collections.deque(maxlen=100)
+        self.stderr_thread = None
         self.relay_sockets = []
         self.relay_sender = None
         self.relay_thread = None
         self.relay_stop = threading.Event()
         self.rtp_metadata_logged = False
+        self.rtcp_rx_logged = False
         self.feedback_ssrc = secrets.randbits(32) or 1
         self.media_ssrc = None
         self.feedback_attempts = 0
         self.last_feedback = 0.0
         self.fir_seq = 0
+        self.srtcp_index = 0
         self.snapshot_reported = False
         self.classification_reported = False
         self.started = time.time()
@@ -1112,6 +1191,25 @@ class EarlyMediaCapture:
         )
         self.sdp_path = RUNTIME_DIR / f"media-{uuid.uuid4().hex}.sdp"
         self.classification_path = RUNTIME_DIR / f"entrance-{uuid.uuid4().hex}.jpg"
+
+    def _drain_stderr(self):
+        proc = self.process
+        if not proc or not proc.stderr:
+            return
+        try:
+            for line in proc.stderr:
+                self.stderr_lines.append(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    def get_stderr_tail(self, max_chars=2000):
+        text = "".join(self.stderr_lines)
+        return text[-max_chars:].strip()
 
     @property
     def sdp_ip(self):
@@ -1176,6 +1274,14 @@ class EarlyMediaCapture:
 
     def start(self):
         stop_post_call_fallback("nuova chiamata")
+        try:
+            self._start_sockets_and_ffmpeg()
+        except Exception:
+            self.close_audio()
+            self.close_relay()
+            raise
+
+    def _start_sockets_and_ffmpeg(self):
         if self.audio:
             for port in (self.audio["local_port"], self.audio["local_port"] + 1):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1245,6 +1351,11 @@ class EarlyMediaCapture:
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             text=True, close_fds=True,
         )
+        self.stderr_lines.clear()
+        self.stderr_thread = threading.Thread(
+            target=self._drain_stderr, daemon=True
+        )
+        self.stderr_thread.start()
         set_snapshot_pending(self.call_id, True)
 
     def poll(self):
@@ -1285,6 +1396,10 @@ class EarlyMediaCapture:
                 f"({self.snapshot.stat().st_size} byte); "
                 f"audio_udp={self.audio_packets}; live=udp://{LIVE_VIDEO_HOST}:{LIVE_VIDEO_PORT}"
             )
+            threading.Thread(
+                target=publish_mqtt_event,
+                args=(self.call_id, "snapshot_ready"), daemon=True,
+            ).start()
             if ENTRANCE_CLASSIFICATION_ENABLED and not self.classification_reported:
                 try:
                     name, distance, reason = classify_entrance_image(self.snapshot)
@@ -1298,7 +1413,7 @@ class EarlyMediaCapture:
                     log(f"ENTRANCE VISUAL FALLBACK: errore {type(exc).__name__}: {exc}")
         if not self.process or self.process.poll() is None:
             return False
-        stderr = self.process.stderr.read()[-2000:].strip()
+        stderr = self.get_stderr_tail(2000)
         if not self.snapshot_reported:
             set_snapshot_pending(self.call_id, False)
         log(f"SNAPSHOT FALLITO call={call_reference(self.call_id)} audio_udp={self.audio_packets}: {stderr or 'nessun frame decodificabile'}")
@@ -1318,13 +1433,11 @@ class EarlyMediaCapture:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=2)
-        if self.process is not None:
-            try:
-                tail = self.process.stderr.read()[-800:].strip()
-            except Exception:
-                tail = ""
-            if tail and not self.snapshot_reported:
-                log(f"FFMPEG DIAG call={call_reference(self.call_id)}: {tail}")
+        if self.stderr_thread and self.stderr_thread.is_alive():
+            self.stderr_thread.join(timeout=0.5)
+        tail = self.get_stderr_tail(800)
+        if tail and not self.snapshot_reported:
+            log(f"FFMPEG DIAG call={call_reference(self.call_id)}: {tail}")
         log(f"Media chiuso call={call_reference(self.call_id)}: {reason}")
         self.close_audio()
         self.close_relay()
@@ -1361,6 +1474,14 @@ class EarlyMediaCapture:
                         self.rtp_metadata_logged = True
                         self.media_ssrc = ssrc
                         self.send_feedback(ssrc)
+                if (sock is self.relay_sockets[1]
+                        and not self.rtcp_rx_logged and len(packet) >= 4):
+                    self.rtcp_rx_logged = True
+                    pt = packet[1]
+                    log(
+                        f"RTCP RX call={call_reference(self.call_id)}: "
+                        f"pt={pt} len={len(packet)}"
+                    )
                 try:
                     self.relay_sender.sendto(packet, destinations[sock])
                 except OSError:
@@ -1373,20 +1494,31 @@ class EarlyMediaCapture:
         """PLI + FIR autenticati; ripetuti finche' non arriva il keyframe."""
         try:
             material = base64.b64decode(self.answer_key, validate=True)
-            pli = make_srtcp_pli(
-                material, self.feedback_ssrc, media_ssrc, index=0
-            )
-            self.relay_sockets[1].sendto(
-                pli, (self.remote_ip, self.remote_rtcp_port)
-            )
-            fir = make_srtcp_fir(
-                material, self.feedback_ssrc, media_ssrc,
-                seq=self.fir_seq, index=0,
-            )
-            self.fir_seq = (self.fir_seq + 1) & 0xff
-            self.relay_sockets[1].sendto(
-                fir, (self.remote_ip, self.remote_rtcp_port)
-            )
+            if self.auth_key is None:
+                self.auth_key = aes_cm_prf(material[:16], material[16:], 0x04, 20)
+            # RFC 3711: l'indice SRTCP si incrementa a ogni pacchetto
+            # inviato, altrimenti il ricevente scarta i duplicati come replay.
+            # Invio su porta RTCP e RTP: alcuni relay inoltrano solo una via.
+            targets = {self.remote_rtcp_port, self.remote_rtp_port}
+            for port in sorted(targets):
+                pli = make_srtcp_pli(
+                    material, self.feedback_ssrc, media_ssrc,
+                    index=self.srtcp_index, auth_key=self.auth_key,
+                )
+                self.srtcp_index = (self.srtcp_index + 1) & 0x7fffffff
+                self.relay_sockets[1].sendto(
+                    pli, (self.remote_ip, port)
+                )
+                fir = make_srtcp_fir(
+                    material, self.feedback_ssrc, media_ssrc,
+                    seq=self.fir_seq, index=self.srtcp_index,
+                    auth_key=self.auth_key,
+                )
+                self.srtcp_index = (self.srtcp_index + 1) & 0x7fffffff
+                self.fir_seq = (self.fir_seq + 1) & 0xff
+                self.relay_sockets[1].sendto(
+                    fir, (self.remote_ip, port)
+                )
             self.feedback_attempts += 1
             self.last_feedback = time.time()
             log(
@@ -1715,6 +1847,11 @@ class HomtouchListener:
             lines.append(f"Contact: {contact}")
 
         lines.append(f"User-Agent: {USER_AGENT}")
+        lines.append(
+            "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, "
+            "REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, UPDATE"
+        )
+        lines.append("Supported: replaces, outbound, gruu")
         if body is not None:
             lines += ["Content-Type: application/sdp", f"Content-Length: {len(body.encode('utf-8'))}", "", body]
         else:
@@ -1739,16 +1876,25 @@ class HomtouchListener:
         next_media = next((i for i, x in enumerate(media[1:], 1) if x.startswith("m=")), len(media))
         media = media[:next_media]
         mparts = media[0].split()
-        remote_rtp_port = int(mparts[1])
+        try:
+            remote_rtp_port = int(mparts[1])
+        except (ValueError, IndexError):
+            raise RuntimeError("porta RTP video non valida")
+        if not 1 <= remote_rtp_port <= 65535:
+            raise RuntimeError("porta RTP video fuori range")
         remote_rtcp_port = remote_rtp_port + 1
         for line in media:
             match = re.match(r"a=rtcp:(\d+)", line, re.I)
             if match:
-                remote_rtcp_port = int(match.group(1))
+                candidate = int(match.group(1))
+                if 1 <= candidate <= 65535:
+                    remote_rtcp_port = candidate
                 break
         remote_ip = sdp_value("\n".join(media), "c=IN IP4 ")
         if not remote_ip:
             remote_ip = sdp_value(body, "c=IN IP4 ") or SERVER_IP
+        if not valid_remote_ip(remote_ip):
+            raise RuntimeError("IP remoto media non valido")
         offered_payloads = mparts[3:]
         payload = None
         for line in media:
@@ -1758,6 +1904,8 @@ class HomtouchListener:
                 break
         if payload is None:
             raise RuntimeError("nessun payload H264/90000 offerto")
+        if not payload.isdigit() or not 0 <= int(payload) <= 127:
+            raise RuntimeError("payload video non valido")
         fmtp = ""
         for line in media:
             match = re.match(rf"a=fmtp:{re.escape(payload)}\s+(.+)", line, re.I)
@@ -1788,36 +1936,56 @@ class HomtouchListener:
             audio_end = next((i for i, x in enumerate(audio_lines[1:], 1) if x.startswith("m=")), len(audio_lines))
             audio_lines = audio_lines[:audio_end]
             audio_parts = audio_lines[0].split()
-            audio_payloads = audio_parts[3:]
-            audio_map = None
-            for line in audio_lines:
-                match = re.match(r"a=rtpmap:(\d+)\s+([^\s]+)", line, re.I)
-                if match and match.group(1) in audio_payloads:
-                    audio_map = (match.group(1), match.group(2))
-                    break
-            audio_crypto = None
-            for line in audio_lines:
-                match = re.match(
-                    r"a=crypto:(\d+)\s+AES_CM_128_HMAC_SHA1_80\s+inline:([^|\s]+)",
-                    line, re.I,
-                )
-                if match:
-                    audio_crypto = (match.group(1), match.group(2))
-                    break
+            try:
+                audio_port = int(audio_parts[1])
+            except (ValueError, IndexError):
+                audio_port = 0
+            if audio_port == 0:
+                audio = None
+                audio_map, audio_crypto = None, None
+            else:
+                if not 1 <= audio_port <= 65535:
+                    audio = None
+                    audio_map, audio_crypto = None, None
+                else:
+                    audio_payloads = audio_parts[3:]
+                    audio_map = None
+                    for line in audio_lines:
+                        match = re.match(r"a=rtpmap:(\d+)\s+([^\s]+)", line, re.I)
+                        if match and match.group(1) in audio_payloads:
+                            audio_map = (match.group(1), match.group(2))
+                            break
+                    audio_crypto = None
+                    for line in audio_lines:
+                        match = re.match(
+                            r"a=crypto:(\d+)\s+AES_CM_128_HMAC_SHA1_80\s+inline:([^|\s]+)",
+                            line, re.I,
+                        )
+                        if match:
+                            try:
+                                key = base64.b64decode(match.group(2), validate=True)
+                            except Exception:
+                                continue
+                            if len(key) != 30:
+                                continue
+                            audio_crypto = (match.group(1), match.group(2))
+                            break
             if audio_map and audio_crypto:
                 audio = {
                     "payload": audio_map[0], "rtpmap": audio_map[1],
                     "crypto_tag": audio_crypto[0], "remote_key": audio_crypto[1],
                 }
+            else:
+                audio = None
         return (payload, fmtp, selected[0], selected[1], media_order, audio,
-                remote_ip, remote_rtcp_port)
+                remote_ip, remote_rtp_port, remote_rtcp_port)
 
 
     def start_early_media(self, raw):
         headers, _ = sip_headers(raw)
         call_id = headers.get("call-id", uuid.uuid4().hex)
         (payload, fmtp, crypto_tag, remote_key, media_order, audio,
-         remote_ip, remote_rtcp_port) = self.parse_video_offer(raw)
+         remote_ip, remote_rtp_port, remote_rtcp_port) = self.parse_video_offer(raw)
         local_port = reserve_udp_pair(self.local_ip)
         internal_port = reserve_udp_pair(
             "127.0.0.1", start=INTERNAL_MEDIA_PORT_START,
@@ -1835,15 +2003,14 @@ class HomtouchListener:
         capture = EarlyMediaCapture(
             call_id, self.local_ip, local_port, internal_port, payload, fmtp,
             remote_key, crypto_tag, media_order, audio, remote_ip,
-            remote_rtcp_port,
+            remote_rtp_port, remote_rtcp_port,
         )
         capture.start()
         # Give FFmpeg a brief chance to bind before advertising the port.
         time.sleep(0.15)
         if capture.process.poll() is not None:
-            error = capture.process.stderr.read()[-2000:].strip()
-            set_snapshot_pending(call_id, False)
-            capture.cleanup_files()
+            error = capture.get_stderr_tail(2000)
+            capture.stop("avvio FFmpeg fallito")
             raise RuntimeError(f"FFmpeg non ha aperto RTP: {error}")
         self.media[call_id] = capture
         to_tag = self.dialog_tags.setdefault(call_id, token(8))
@@ -1853,6 +2020,11 @@ class HomtouchListener:
         )
         self.respond_basic(raw, 183, "Session Progress", to_tag,
                            capture.answer_sdp, contact=contact)
+        if ANSWER_CALLS:
+            self.respond_basic(raw, 200, "OK", to_tag,
+                               capture.answer_sdp, contact=contact)
+            log("200 OK inviato (answer_calls attivo: gli altri posti "
+                "potrebbero smettere di squillare)")
         log(
             f"183 inviato: call={call_reference(call_id)} RTP/SRTP attivo "
             f"H264 PT={payload} crypto-tag={crypto_tag} "
@@ -1861,16 +2033,18 @@ class HomtouchListener:
         )
         # HomeKit deve notificare subito; la snapshot pulita continua a essere
         # generata in parallelo e sostituisce automaticamente quella precedente.
-        notify_incoming_call(call_id)
+        notify_incoming_call(call_id, capture.snapshot, capture.started)
 
 
     def maintain_media(self):
         for call_id, capture in list(self.media.items()):
             if capture.poll():
                 self.media.pop(call_id, None)
+                self.dialog_tags.pop(call_id, None)
             elif time.time() - capture.started > MEDIA_TIMEOUT + 5:
                 capture.stop("timeout")
                 self.media.pop(call_id, None)
+                self.dialog_tags.pop(call_id, None)
 
 
     def stop_media_for(self, raw, reason):
@@ -1879,6 +2053,7 @@ class HomtouchListener:
         capture = self.media.pop(call_id, None)
         if capture:
             capture.stop(reason)
+        self.dialog_tags.pop(call_id, None)
 
 
     def save_raw(self, raw, kind):
@@ -1962,6 +2137,33 @@ class HomtouchListener:
         log(f"SIP RX: {method or 'UNKNOWN'}")
 
         if method == "INVITE":
+            if has_obs_fold(raw):
+                log("INVITE scartato: header piegato (obs-fold)")
+                self.respond_basic(raw, 400, "Bad Request")
+                return
+            headers, _ = sip_headers(raw)
+            call_id = headers.get("call-id", "")
+            if (not call_id or "from" not in headers or "to" not in headers
+                    or not valid_sip_contact(headers.get("contact", ""))):
+                log("INVITE scartato: headers mancanti o Contact non valido")
+                self.respond_basic(raw, 400, "Bad Request")
+                return
+            existing = self.media.get(call_id)
+            if (existing is not None and existing.process is not None
+                    and existing.process.poll() is None):
+                log(f"INVITE duplicato call={call_reference(call_id)}: "
+                    "reinvio 183 senza nuova capture")
+                to_tag = self.dialog_tags.setdefault(call_id, token(8))
+                self.respond_basic(
+                    raw, 100, "Trying")
+                contact = (
+                    f"<sip:{self.username}@{self.local_ip}:{self.local_port}"
+                    ";transport=tls>"
+                )
+                self.respond_basic(raw, 183, "Session Progress", to_tag,
+                                   existing.answer_sdp, contact=contact)
+                return
+            self.media.pop(call_id, None)
             self.analyse_invite(raw)
             self.respond_basic(
                 raw,
@@ -2001,6 +2203,15 @@ class HomtouchListener:
                 "BYE"
             )
 
+            headers, _ = sip_headers(raw)
+            call_id = headers.get("call-id", "")
+            if call_id not in self.media and call_id not in self.dialog_tags:
+                self.respond_basic(
+                    raw,
+                    481,
+                    "Call/Transaction Does Not Exist"
+                )
+                return
             self.respond_basic(
                 raw,
                 200,

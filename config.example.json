@@ -15,6 +15,8 @@
   "private_key_file": "/path/to/client.key",
   "ca_file": "/path/to/ca-chain.cert.pem",
   "homekit_doorbell_name": "Videocitofono",
+  "doorbell_snapshot_timeout": 0.0,
+  "answer_calls": false,
   "http_bind": "127.0.0.1",
   "opener": {
     "enabled": false,

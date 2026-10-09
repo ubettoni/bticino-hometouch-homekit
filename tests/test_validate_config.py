@@ -134,6 +134,17 @@ class ValidateConfigTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "media_ports"):
                 validate(config)
 
+    def test_answer_calls_must_be_bool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = self.make_config(root)
+            data["answer_calls"] = "yes"
+            config = root / "config.json"
+            config.write_text(json.dumps(data))
+            with patch("scripts.validate_config.shutil.which", return_value="/usr/bin/tool"), \
+                    self.assertRaisesRegex(ValueError, "answer_calls"):
+                validate(config)
+
     def test_lan_bind_without_token_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
